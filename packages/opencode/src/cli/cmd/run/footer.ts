@@ -84,6 +84,7 @@ type RunFooterOptions = {
   theme: RunTheme
   keymap: Keymap<Renderable, KeyEvent>
   tuiConfig: RunTuiConfig
+  backgroundSubagents: boolean
   diffStyle: RunDiffStyle
   onPermissionReply: (input: PermissionReply) => void | Promise<void>
   onQuestionReply: (input: QuestionReply) => void | Promise<void>
@@ -92,6 +93,7 @@ type RunFooterOptions = {
   onModelSelect?: (model: NonNullable<RunInput["model"]>) => CycleResult | void | Promise<CycleResult | void>
   onVariantSelect?: (variant: string | undefined) => CycleResult | void | Promise<CycleResult | void>
   onInterrupt?: () => void
+  onBackground?: () => void
   onExit?: () => void
   onSubagentSelect?: (sessionID: string | undefined) => void
   treeSitterClient?: TreeSitterClient
@@ -171,6 +173,7 @@ export class RunFooter implements FooterApi {
   private queue: StreamCommit[] = []
   private pending = false
   private flushing: Promise<void> = Promise.resolve()
+  private flushError: unknown
   // Fixed portion of footer height above the textarea.
   private base: number
   private rows = TEXTAREA_MIN_ROWS
@@ -203,6 +206,15 @@ export class RunFooter implements FooterApi {
   private exitTimeout: NodeJS.Timeout | undefined
   private requestExitHandler: (() => boolean) | undefined
   private scrollback: RunScrollbackStream
+
+  private createScrollback(wrote: boolean): RunScrollbackStream {
+    return new RunScrollbackStream(this.renderer, this.options.theme, {
+      diffStyle: this.options.diffStyle,
+      wrote,
+      sessionID: this.options.sessionID,
+      treeSitterClient: this.options.treeSitterClient,
+    })
+  }
 
   constructor(
     private renderer: CliRenderer,
@@ -257,12 +269,7 @@ export class RunFooter implements FooterApi {
     this.queuedPrompts = queuedPrompts
     this.setQueuedPrompts = setQueuedPrompts
     this.base = Math.max(1, renderer.footerHeight - TEXTAREA_MIN_ROWS)
-    this.scrollback = new RunScrollbackStream(renderer, options.theme, {
-      diffStyle: options.diffStyle,
-      wrote: options.wrote,
-      sessionID: options.sessionID,
-      treeSitterClient: options.treeSitterClient,
-    })
+    this.scrollback = this.createScrollback(options.wrote ?? false)
 
     this.renderer.on(CliRenderEvents.DESTROY, this.handleDestroy)
 
@@ -289,6 +296,7 @@ export class RunFooter implements FooterApi {
               theme: options.theme,
               diffStyle: options.diffStyle,
               tuiConfig: options.tuiConfig,
+              backgroundSubagents: options.backgroundSubagents,
               history: options.history,
               agent: options.agentLabel,
               onSubmit: footer.handlePrompt,
@@ -297,6 +305,7 @@ export class RunFooter implements FooterApi {
               onQuestionReject: footer.handleQuestionReject,
               onCycle: footer.handleCycle,
               onInterrupt: footer.handleInterrupt,
+              onBackground: options.onBackground,
               onInputClear: footer.handleInputClear,
               onExitRequest: footer.handleExit,
               onRequestExit: footer.setRequestExitHandler,
@@ -465,7 +474,9 @@ export class RunFooter implements FooterApi {
           },
         ),
       )
-      .catch(() => {})
+      .catch((error) => {
+        this.flushError = error
+      })
   }
 
   private present(view: FooterView): void {
@@ -523,6 +534,12 @@ export class RunFooter implements FooterApi {
     }
 
     return this.flushing.then(async () => {
+      if (this.flushError !== undefined) {
+        const error = this.flushError
+        this.flushError = undefined
+        throw error
+      }
+
       if (this.isGone) {
         return
       }
@@ -533,6 +550,15 @@ export class RunFooter implements FooterApi {
 
       await this.renderer.idle().catch(() => {})
     })
+  }
+
+  public resetForReplay(wrote: boolean): void {
+    if (this.isGone) {
+      return
+    }
+
+    this.scrollback.destroy()
+    this.scrollback = this.createScrollback(wrote)
   }
 
   public close(): void {
@@ -717,7 +743,11 @@ export class RunFooter implements FooterApi {
       return
     }
 
+    const previous = this.currentModel()
     this.setCurrentModel(model)
+    if (!previous || previous.providerID !== model.providerID || previous.modelID !== model.modelID) {
+      this.setCurrentVariant(undefined)
+    }
     void Promise.resolve()
       .then(() => this.options.onModelSelect?.(model))
       .then((result) => {
@@ -936,6 +966,8 @@ export class RunFooter implements FooterApi {
           },
         ),
       )
-      .catch(() => {})
+      .catch((error) => {
+        this.flushError = error
+      })
   }
 }
